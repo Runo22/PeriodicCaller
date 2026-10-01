@@ -11,7 +11,7 @@
 //   2. High-resolution waitable timer (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
 //      Windows 10 1803+) instead of Sleep(), which is bound to the ~15.6 ms
 //      system tick. Falls back to a classic timer + timeBeginPeriod(1).
-//   3. Optional hybrid spin: wake up `spinThreshold` early and busy-wait the
+//   3. Optional hybrid spin: wake up `spin_threshold` early and busy-wait the
 //      last few microseconds. Disabled by default because it uses CPU.
 
 #include <chrono>
@@ -32,26 +32,26 @@ enum class MissedTickPolicy {
 };
 
 struct TaskOptions {
-    MissedTickPolicy missedTickPolicy = MissedTickPolicy::Skip;
+    MissedTickPolicy missed_tick_policy = MissedTickPolicy::Skip;
     // true: first call happens right away; false: first call after one period.
-    bool runImmediately = false;
+    bool run_immediately = false;
 };
 
 struct SchedulerOptions {
     // Busy-wait window before each deadline. 0 disables spinning (default).
     // ~100-300 us typically gives microsecond-level accuracy.
-    std::chrono::microseconds spinThreshold{0};
+    std::chrono::microseconds spin_threshold{0};
     // Raise the worker thread to THREAD_PRIORITY_TIME_CRITICAL.
-    bool highPriorityThread = true;
+    bool high_priority_thread = true;
 };
 
 struct TaskStats {
     std::uint64_t runs = 0;
-    std::uint64_t missedTicks = 0;  // Ticks skipped under MissedTickPolicy::Skip.
+    std::uint64_t missed_ticks = 0;  // Ticks skipped under MissedTickPolicy::Skip.
     std::uint64_t exceptions = 0;   // Exceptions thrown (and swallowed) by the task.
-    std::chrono::nanoseconds lastLateness{0};  // Actual start - scheduled start.
-    std::chrono::nanoseconds maxLateness{0};
-    std::chrono::nanoseconds avgLateness{0};
+    std::chrono::nanoseconds last_lateness{0};  // Actual start - scheduled start.
+    std::chrono::nanoseconds max_lateness{0};
+    std::chrono::nanoseconds avg_lateness{0};
 };
 
 using TaskId = std::uint64_t;
@@ -74,7 +74,7 @@ public:
     bool remove(TaskId id);
 
     // Changes the period of a task; the new grid starts from its next deadline.
-    bool setPeriod(TaskId id, std::chrono::nanoseconds period);
+    bool set_period(TaskId id, std::chrono::nanoseconds period);
 
     std::optional<TaskStats> stats(TaskId id) const;
 
@@ -82,11 +82,11 @@ public:
     void stop();
 
     // true if the high-resolution waitable timer is in use.
-    bool usesHighResolutionTimer() const noexcept;
+    bool uses_high_resolution_timer() const noexcept;
 
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::unique_ptr<Impl> _impl;
 };
 
 }  // namespace periodic_caller
