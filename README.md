@@ -61,14 +61,22 @@ int main() {
 
 ## Derleme
 
-Gereksinimler: Windows 10+, CMake 3.20+, C++23 derleyici (Visual Studio 2022 17.6+ veya MinGW-w64 GCC 13+).
+Gereksinimler: Windows 10 1803+ (daha eskisi de çalışır, hassasiyet düşer), **MSVC / Visual Studio 2022 17.2+**, CMake 3.21+.
+Yalnızca MSVC desteklenir.
 
 ```bat
-cmake -S . -B build
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
+cmake --preset msvc-x64
+cmake --build --preset release
+ctest --preset release
 build\Release\periodic_caller_example.exe
 ```
+
+Visual Studio'da: **File → Open → Folder** ile klasörü açın; `CMakePresets.json` otomatik tanınır.
+
+CMake kullanmadan mevcut bir `.vcxproj`'a eklemek için:
+1. `src/PeriodicCaller.cpp` dosyasını projeye ekleyin, `include/` klasörünü *Additional Include Directories*'e ekleyin.
+2. *C++ Language Standard* = **Preview - Features from the Latest C++ Working Draft (`/std:c++latest`)**.
+3. `winmm.lib` kod içinden (`#pragma comment`) otomatik linklenir.
 
 Başka bir CMake projesinde:
 

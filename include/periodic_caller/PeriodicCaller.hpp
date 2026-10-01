@@ -23,6 +23,11 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <version>
+
+#if !defined(__cpp_lib_move_only_function)
+#error "PeriodicCaller requires C++23 std::move_only_function: VS 2022 17.2+ with /std:c++latest (CMake: cxx_std_23)."
+#endif
 
 namespace periodic_caller {
 

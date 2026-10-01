@@ -9,6 +9,9 @@
 #include <windows.h>
 #include <timeapi.h>
 
+// Lets the .cpp be dropped into a plain Visual Studio project without extra linker setup.
+#pragma comment(lib, "winmm.lib")
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -74,7 +77,7 @@ public:
                 ULONG version, control_mask, state_mask;
             } state{1, 0x1 /* EXECUTION_SPEED */, 0 /* not throttled */};
             constexpr int thread_power_throttling = 3;
-            set_information(self, thread_power_throttling, &state, sizeof(state));
+            set_information(self, thread_power_throttling, &state, static_cast<DWORD>(sizeof(state)));
         }
 
         if (options.high_priority_thread) SetThreadPriority(self, THREAD_PRIORITY_TIME_CRITICAL);
