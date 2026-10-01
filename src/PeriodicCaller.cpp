@@ -10,12 +10,15 @@
 #include <timeapi.h>
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
 #include <mutex>
 #include <stdexcept>
 #include <stop_token>
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -36,7 +39,6 @@ LONGLONG to_relative_due_time(nanoseconds wait) {
 struct UniqueHandle {
     HANDLE h = nullptr;
     UniqueHandle() = default;
-    explicit UniqueHandle(HANDLE handle) : h(handle) {}
     UniqueHandle(const UniqueHandle&) = delete;
     UniqueHandle& operator=(const UniqueHandle&) = delete;
     ~UniqueHandle() {
@@ -44,34 +46,112 @@ struct UniqueHandle {
     }
 };
 
+// Resolved at runtime so the library builds with any SDK/MinGW and still runs
+// on Windows versions that lack the newer APIs.
+template <class Fn>
+Fn load_function(const wchar_t* module, const char* name) {
+    HMODULE m = GetModuleHandleW(module);
+    if (!m) m = LoadLibraryExW(module, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    return m ? std::bit_cast<Fn>(GetProcAddress(m, name)) : nullptr;
+}
+
+// Applies the timing-related settings to the calling thread for its lifetime.
+class ThreadTuning {
+public:
+    ThreadTuning(const SchedulerOptions& options, const wchar_t* name) {
+        const HANDLE self = GetCurrentThread();
+
+        static const auto set_description =
+            load_function<HRESULT(WINAPI*)(HANDLE, PCWSTR)>(L"kernel32.dll", "SetThreadDescription");
+        if (set_description) set_description(self, name);
+
+        // Opt out of EcoQoS: otherwise Windows 11 may move a background app's
+        // threads to efficiency cores / lower clocks, which adds jitter.
+        static const auto set_information = load_function<BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD)>(
+            L"kernel32.dll", "SetThreadInformation");
+        if (set_information) {
+            struct {
+                ULONG version, control_mask, state_mask;
+            } state{1, 0x1 /* EXECUTION_SPEED */, 0 /* not throttled */};
+            constexpr int thread_power_throttling = 3;
+            set_information(self, thread_power_throttling, &state, sizeof(state));
+        }
+
+        if (options.high_priority_thread) SetThreadPriority(self, THREAD_PRIORITY_TIME_CRITICAL);
+
+        if (options.use_mmcss) {
+            static const auto av_set = load_function<HANDLE(WINAPI*)(LPCWSTR, LPDWORD)>(
+                L"avrt.dll", "AvSetMmThreadCharacteristicsW");
+            DWORD task_index = 0;
+            if (av_set) _mmcss = av_set(L"Pro Audio", &task_index);
+        }
+    }
+
+    ~ThreadTuning() {
+        if (!_mmcss) return;
+        static const auto av_revert =
+            load_function<BOOL(WINAPI*)(HANDLE)>(L"avrt.dll", "AvRevertMmThreadCharacteristics");
+        if (av_revert) av_revert(_mmcss);
+    }
+
+    ThreadTuning(const ThreadTuning&) = delete;
+    ThreadTuning& operator=(const ThreadTuning&) = delete;
+
+private:
+    HANDLE _mmcss = nullptr;
+};
+
+struct RunResult {
+    Clock::time_point start;
+    Clock::time_point end;
+    bool threw = false;
+};
+
 }  // namespace
 
 struct PeriodicCaller::Impl {
+    // All fields are guarded by Impl::_mutex, except `task` (only touched by the
+    // thread that runs it) and `worker_exited`.
     struct Entry {
-        TaskId id;
-        nanoseconds period;
-        Clock::time_point next;
+        TaskId id = 0;
+        nanoseconds period{};
+        Clock::time_point next;  // Next tick on the absolute grid.
         Task task;
-        MissedTickPolicy policy;
+        TaskOptions options;
         TaskStats stats;
         nanoseconds lateness_sum{0};
         bool removed = false;
+
+        // Dedicated mode only.
         bool executing = false;
+        Clock::time_point dispatched_tick;
+        std::optional<Clock::time_point> pending_tick;  // Coalesced run.
+        UniqueHandle run_event;                         // Auto-reset.
+        std::jthread worker;
+        std::atomic<bool> worker_exited = false;
+    };
+
+    // A dedicated worker that was asked to stop but has not been joined yet.
+    struct Retired {
+        std::jthread thread;
+        std::shared_ptr<Entry> entry;
     };
 
     SchedulerOptions _options;
     mutable std::mutex _mutex;
     std::unordered_map<TaskId, std::shared_ptr<Entry>> _entries;
+    std::vector<Retired> _retired;
     TaskId _next_id = 1;
+    bool _stopped = false;
 
     UniqueHandle _timer;
     UniqueHandle _wake_event;  // Auto-reset; signalled whenever the schedule changes.
     bool _high_resolution = false;
     bool _time_period_raised = false;
 
-    std::jthread _worker;
+    std::jthread _scheduler;
 
-    explicit Impl(SchedulerOptions opts) : _options(opts) {
+    explicit Impl(SchedulerOptions opts) : _options(std::move(opts)) {
         _timer.h = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                           TIMER_ALL_ACCESS);
         _high_resolution = _timer.h != nullptr;
@@ -86,7 +166,7 @@ struct PeriodicCaller::Impl {
             throw std::runtime_error("PeriodicCaller: failed to create timer/event handles");
         }
 
-        _worker = std::jthread([this](std::stop_token st) { run(st); });
+        _scheduler = std::jthread([this](std::stop_token st) { scheduler_loop(st); });
     }
 
     ~Impl() {
@@ -97,11 +177,88 @@ struct PeriodicCaller::Impl {
     void wake() { SetEvent(_wake_event.h); }
 
     void stop() {
-        if (!_worker.joinable()) return;
-        _worker.request_stop();
+        {
+            std::scoped_lock lock(_mutex);
+            _stopped = true;
+            for (auto& [id, e] : _entries) retire_locked(e);
+        }
+        _scheduler.request_stop();
         wake();
         // Joining from inside a task would deadlock; the loop exits on its own.
-        if (_worker.get_id() != std::this_thread::get_id()) _worker.join();
+        if (_scheduler.joinable() && _scheduler.get_id() != std::this_thread::get_id()) {
+            _scheduler.join();
+        }
+        reap(true);
+    }
+
+    TaskId add(nanoseconds period, Task task, TaskOptions options) {
+        auto entry = std::make_shared<Entry>();
+        entry->period = period;
+        entry->task = std::move(task);
+        entry->options = options;
+        entry->next = Clock::now() + (options.run_immediately ? nanoseconds::zero() : period);
+
+        const bool dedicated = options.execution_mode == ExecutionMode::Dedicated;
+        if (dedicated) {
+            entry->run_event.h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!entry->run_event.h) throw std::runtime_error("PeriodicCaller: failed to create event");
+        }
+
+        TaskId id;
+        {
+            std::scoped_lock lock(_mutex);
+            if (_stopped) throw std::logic_error("PeriodicCaller::add: scheduler is stopped");
+            id = _next_id++;
+            entry->id = id;
+            if (dedicated) {
+                entry->worker = std::jthread(
+                    [this, entry](std::stop_token st) { dedicated_loop(st, entry); });
+            }
+            _entries.emplace(id, std::move(entry));
+        }
+        wake();
+        return id;
+    }
+
+    bool remove(TaskId id) {
+        {
+            std::scoped_lock lock(_mutex);
+            const auto it = _entries.find(id);
+            if (it == _entries.end()) return false;
+            it->second->removed = true;
+            retire_locked(it->second);
+            _entries.erase(it);
+        }
+        wake();
+        reap(false);
+        return true;
+    }
+
+    // Asks a dedicated worker to exit; it is joined later by reap().
+    void retire_locked(const std::shared_ptr<Entry>& e) {
+        if (!e->worker.joinable()) return;
+        e->worker.request_stop();
+        SetEvent(e->run_event.h);
+        _retired.push_back({std::move(e->worker), e});
+    }
+
+    // Joins retired workers: all of them, or only those that already exited.
+    // Never joins the calling thread itself.
+    void reap(bool all) {
+        std::vector<Retired> done;
+        {
+            std::scoped_lock lock(_mutex);
+            for (auto it = _retired.begin(); it != _retired.end();) {
+                const bool is_self = it->thread.get_id() == std::this_thread::get_id();
+                if (is_self || (!all && !it->entry->worker_exited)) {
+                    ++it;
+                    continue;
+                }
+                done.push_back(std::move(*it));
+                it = _retired.erase(it);
+            }
+        }
+        // `done` goes out of scope here: std::jthread joins, outside the lock.
     }
 
     // Sleeps until `deadline`. Returns false if woken early by _wake_event.
@@ -125,10 +282,66 @@ struct PeriodicCaller::Impl {
         return true;
     }
 
-    void run(std::stop_token st) {
-        if (_options.high_priority_thread) {
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    // Runs the task body; called without the lock held.
+    RunResult invoke(Entry& e) {
+        RunResult r;
+        std::exception_ptr error;
+        r.start = Clock::now();
+        try {
+            e.task();
+        } catch (...) {
+            error = std::current_exception();
         }
+        r.end = Clock::now();
+        if (error) {
+            r.threw = true;
+            if (_options.on_error) {
+                try {
+                    _options.on_error(e.id, error);
+                } catch (...) {
+                }
+            }
+        }
+        return r;
+    }
+
+    static void record_locked(Entry& e, Clock::time_point tick, const RunResult& r) {
+        auto& s = e.stats;
+        const auto lateness = std::chrono::duration_cast<nanoseconds>(r.start - tick);
+        const auto duration = std::chrono::duration_cast<nanoseconds>(r.end - r.start);
+        ++s.runs;
+        if (r.threw) ++s.exceptions;
+        s.last_lateness = lateness;
+        s.max_lateness = std::max(s.max_lateness, lateness);
+        e.lateness_sum += lateness;
+        s.avg_lateness = e.lateness_sum / static_cast<long long>(s.runs);
+        s.last_duration = duration;
+        s.max_duration = std::max(s.max_duration, duration);
+    }
+
+    static void skip_missed_locked(Entry& e, Clock::time_point now) {
+        if (e.next > now || e.options.missed_tick_policy != MissedTickPolicy::Skip) return;
+        const auto behind = (now - e.next) / e.period + 1;
+        e.next += behind * e.period;
+        e.stats.missed_ticks += static_cast<std::uint64_t>(behind);
+    }
+
+    void dispatch_dedicated_locked(Entry& e, Clock::time_point tick) {
+        if (e.executing) {
+            if (e.options.overlap_policy == OverlapPolicy::Coalesce && !e.pending_tick) {
+                e.pending_tick = tick;
+            } else {
+                ++e.stats.overrun_skips;
+            }
+            return;
+        }
+        e.executing = true;
+        e.dispatched_tick = tick;
+        SetEvent(e.run_event.h);
+    }
+
+    void scheduler_loop(std::stop_token st) {
+        ThreadTuning tuning(_options, L"PeriodicCaller scheduler");
 
         std::unique_lock lock(_mutex);
         while (!st.stop_requested()) {
@@ -144,51 +357,56 @@ struct PeriodicCaller::Impl {
                 continue;
             }
 
-            const auto scheduled = due->next;
-            if (Clock::now() < scheduled) {
+            const auto tick = due->next;
+            if (Clock::now() < tick) {
                 lock.unlock();
-                wait_until(scheduled);
+                wait_until(tick);
                 lock.lock();
                 continue;  // Re-evaluate: the schedule may have changed meanwhile.
             }
 
-            due->executing = true;
-            lock.unlock();
-            const auto start = Clock::now();
-            bool threw = false;
-            try {
-                due->task();
-            } catch (...) {
-                threw = true;
-            }
-            const auto end = Clock::now();
-            lock.lock();
-            due->executing = false;
-
-            if (due->removed) continue;
-
-            auto& s = due->stats;
-            const auto lateness = std::chrono::duration_cast<nanoseconds>(start - scheduled);
-            ++s.runs;
-            if (threw) ++s.exceptions;
-            s.last_lateness = lateness;
-            s.max_lateness = std::max(s.max_lateness, lateness);
-            due->lateness_sum += lateness;
-            s.avg_lateness = due->lateness_sum / static_cast<long long>(s.runs);
-
-            // Advance on the absolute grid; never relative to `end` (that drifts).
+            // Advance on the absolute grid; never relative to "now" (that drifts).
             due->next += due->period;
-            if (due->next <= end && due->policy == MissedTickPolicy::Skip) {
-                const auto behind = (end - due->next) / due->period + 1;
-                due->next += behind * due->period;
-                s.missed_ticks += static_cast<std::uint64_t>(behind);
+
+            if (due->options.execution_mode == ExecutionMode::Dedicated) {
+                dispatch_dedicated_locked(*due, tick);
+            } else {
+                lock.unlock();
+                const auto result = invoke(*due);
+                lock.lock();
+                if (due->removed) continue;
+                record_locked(*due, tick, result);
+            }
+            skip_missed_locked(*due, Clock::now());
+        }
+    }
+
+    void dedicated_loop(std::stop_token st, std::shared_ptr<Entry> e) {
+        {
+            ThreadTuning tuning(_options, L"PeriodicCaller worker");
+            while (WaitForSingleObject(e->run_event.h, INFINITE) == WAIT_OBJECT_0 &&
+                   !st.stop_requested()) {
+                std::unique_lock lock(_mutex);
+                if (!e->executing) continue;
+                auto tick = e->dispatched_tick;
+                while (true) {
+                    lock.unlock();
+                    const auto result = invoke(*e);
+                    lock.lock();
+                    record_locked(*e, tick, result);
+                    if (!e->pending_tick || e->removed || st.stop_requested()) break;
+                    tick = *std::exchange(e->pending_tick, std::nullopt);
+                }
+                e->pending_tick.reset();
+                e->executing = false;
             }
         }
+        e->worker_exited = true;
     }
 };
 
 PeriodicCaller::PeriodicCaller(SchedulerOptions options)
-    : _impl(std::make_unique<Impl>(options)) {}
+    : _impl(std::make_unique<Impl>(std::move(options))) {}
 
 PeriodicCaller::~PeriodicCaller() = default;
 
@@ -197,35 +415,10 @@ TaskId PeriodicCaller::add(std::chrono::nanoseconds period, Task task, TaskOptio
         throw std::invalid_argument("PeriodicCaller::add: period must be positive");
     }
     if (!task) throw std::invalid_argument("PeriodicCaller::add: task is empty");
-
-    auto entry = std::make_shared<Impl::Entry>();
-    entry->period = period;
-    entry->task = std::move(task);
-    entry->policy = options.missed_tick_policy;
-    entry->next = Clock::now() + (options.run_immediately ? std::chrono::nanoseconds::zero() : period);
-
-    TaskId id;
-    {
-        std::scoped_lock lock(_impl->_mutex);
-        id = _impl->_next_id++;
-        entry->id = id;
-        _impl->_entries.emplace(id, std::move(entry));
-    }
-    _impl->wake();
-    return id;
+    return _impl->add(period, std::move(task), options);
 }
 
-bool PeriodicCaller::remove(TaskId id) {
-    {
-        std::scoped_lock lock(_impl->_mutex);
-        const auto it = _impl->_entries.find(id);
-        if (it == _impl->_entries.end()) return false;
-        it->second->removed = true;
-        _impl->_entries.erase(it);
-    }
-    _impl->wake();
-    return true;
-}
+bool PeriodicCaller::remove(TaskId id) { return _impl->remove(id); }
 
 bool PeriodicCaller::set_period(TaskId id, std::chrono::nanoseconds period) {
     if (period <= std::chrono::nanoseconds::zero()) {
@@ -236,8 +429,8 @@ bool PeriodicCaller::set_period(TaskId id, std::chrono::nanoseconds period) {
         const auto it = _impl->_entries.find(id);
         if (it == _impl->_entries.end()) return false;
         auto& e = *it->second;
-        // While executing, `next` is the current tick and gets advanced afterwards.
-        if (!e.executing) e.next += period - e.period;
+        // `next` is always one old period past the last tick; re-base it.
+        e.next += period - e.period;
         e.period = period;
     }
     _impl->wake();

@@ -112,6 +112,101 @@ static void test_set_period() {
     CHECK(n >= 40);
 }
 
+static void test_dedicated_does_not_block_inline() {
+    pc::PeriodicCaller caller;
+    std::atomic<int> fast{0};
+    const auto fast_id = caller.add(2ms, [&] { ++fast; });
+    caller.add(10ms, [] { std::this_thread::sleep_for(30ms); },
+               {.execution_mode = pc::ExecutionMode::Dedicated});
+    std::this_thread::sleep_for(500ms);
+    caller.stop();
+    // ~250 expected; inline would have managed far fewer behind a 30 ms task.
+    CHECK(fast >= 200);
+    CHECK(caller.stats(fast_id)->avg_lateness < 5ms);
+}
+
+static void test_dedicated_overlap_skip() {
+    pc::PeriodicCaller caller;
+    const auto id = caller.add(10ms, [] { std::this_thread::sleep_for(25ms); },
+                               {.execution_mode = pc::ExecutionMode::Dedicated});
+    std::this_thread::sleep_for(500ms);
+    caller.stop();
+    const auto s = caller.stats(id);
+    // Runs every 3rd tick (0, 30, 60 ms ...) -> ~16 runs, ~2 skips per run.
+    CHECK(s->runs >= 10 && s->runs <= 20);
+    CHECK(s->overrun_skips >= s->runs);
+    CHECK(s->max_duration >= 25ms);
+}
+
+static void test_dedicated_coalesce() {
+    pc::PeriodicCaller caller;
+    const auto id = caller.add(10ms, [] { std::this_thread::sleep_for(25ms); },
+                               {.execution_mode = pc::ExecutionMode::Dedicated,
+                                .overlap_policy = pc::OverlapPolicy::Coalesce});
+    std::this_thread::sleep_for(500ms);
+    caller.stop();
+    const auto s = caller.stats(id);
+    // Back-to-back runs -> ~20 runs; some ticks still dropped (only one is kept).
+    CHECK(s->runs >= 16 && s->runs <= 21);
+    CHECK(s->overrun_skips > 0);
+}
+
+static void test_dedicated_self_remove() {
+    pc::PeriodicCaller caller;
+    std::atomic<int> n{0};
+    pc::TaskId id = 0;
+    id = caller.add(2ms, [&] {
+        if (++n == 3) caller.remove(id);
+    }, {.execution_mode = pc::ExecutionMode::Dedicated});
+    std::this_thread::sleep_for(100ms);
+    CHECK(n == 3);
+    CHECK(!caller.stats(id).has_value());
+}
+
+static void test_on_error_handler() {
+    std::atomic<int> handled{0};
+    pc::TaskId seen = 0;
+    pc::PeriodicCaller caller({.on_error = [&](pc::TaskId id, std::exception_ptr e) {
+        seen = id;
+        try {
+            std::rethrow_exception(e);
+        } catch (const std::runtime_error&) {
+            ++handled;
+        }
+    }});
+    const auto id = caller.add(5ms, [] { throw std::runtime_error("boom"); },
+                               {.execution_mode = pc::ExecutionMode::Dedicated});
+    std::this_thread::sleep_for(50ms);
+    caller.stop();
+    CHECK(handled > 0);
+    CHECK(seen == id);
+}
+
+static void test_destroy_while_dedicated_running() {
+    std::atomic<bool> finished{false};
+    {
+        pc::PeriodicCaller caller;
+        caller.add(1ms, [&] {
+            std::this_thread::sleep_for(50ms);
+            finished = true;
+        }, {.execution_mode = pc::ExecutionMode::Dedicated, .run_immediately = true});
+        std::this_thread::sleep_for(10ms);
+    }  // Must wait for the running task, then exit cleanly.
+    CHECK(finished);
+}
+
+static void test_add_after_stop_throws() {
+    pc::PeriodicCaller caller;
+    caller.stop();
+    bool threw = false;
+    try {
+        caller.add(1ms, [] {});
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 int main() {
     test_runs_at_period();
     test_no_drift();
@@ -121,6 +216,13 @@ int main() {
     test_exceptions_are_contained();
     test_invalid_args();
     test_set_period();
+    test_dedicated_does_not_block_inline();
+    test_dedicated_overlap_skip();
+    test_dedicated_coalesce();
+    test_dedicated_self_remove();
+    test_on_error_handler();
+    test_destroy_while_dedicated_running();
+    test_add_after_stop_throws();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return EXIT_FAILURE;
