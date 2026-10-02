@@ -20,28 +20,46 @@ static int failures = 0;
         }                                                                    \
     } while (0)
 
+// std::this_thread::sleep_for is bound to the ~15.6 ms Windows system tick, so
+// a "6 ms" sleep can take 15 ms. Task bodies busy-wait to get exact durations.
+static void busy_for(std::chrono::nanoseconds d) {
+    const auto end = pc::Clock::now() + d;
+    while (pc::Clock::now() < end) {
+    }
+}
+
+// Number of whole periods between `start` and now: the exact tick count a
+// drift-free schedule must have reached (sleep_for may oversleep the window).
+static int ticks_since(pc::Clock::time_point start, std::chrono::nanoseconds period) {
+    return static_cast<int>((pc::Clock::now() - start) / period);
+}
+
 static void test_runs_at_period() {
     pc::PeriodicCaller caller;
     std::atomic<int> n{0};
+    const auto start = pc::Clock::now();
     const auto id = caller.add(5ms, [&] { ++n; });
     std::this_thread::sleep_for(500ms);
     caller.stop();
-    // ~100 expected; generous bounds for shared CI runners.
-    CHECK(n >= 80 && n <= 102);
+    const int expected = ticks_since(start, 5ms);
+    // Never more than the grid allows; generous lower bound for shared CI runners.
+    CHECK(n <= expected + 1 && n >= expected * 8 / 10);
     CHECK(caller.stats(id)->runs == static_cast<std::uint64_t>(n.load()));
 }
 
 static void test_no_drift() {
     pc::PeriodicCaller caller;
     std::atomic<int> n{0};
+    const auto start = pc::Clock::now();
     // Task takes 60% of its period; an absolute schedule must not drift.
     caller.add(10ms, [&] {
         ++n;
-        std::this_thread::sleep_for(6ms);
+        busy_for(6ms);
     });
     std::this_thread::sleep_for(1000ms);
     caller.stop();
-    CHECK(n >= 90 && n <= 101);
+    const int expected = ticks_since(start, 10ms);
+    CHECK(n <= expected + 1 && n >= expected * 9 / 10);
 }
 
 static void test_remove_and_self_remove() {
@@ -116,7 +134,7 @@ static void test_dedicated_does_not_block_inline() {
     pc::PeriodicCaller caller;
     std::atomic<int> fast{0};
     const auto fast_id = caller.add(2ms, [&] { ++fast; });
-    caller.add(10ms, [] { std::this_thread::sleep_for(30ms); },
+    caller.add(10ms, [] { busy_for(30ms); },
                {.execution_mode = pc::ExecutionMode::Dedicated});
     std::this_thread::sleep_for(500ms);
     caller.stop();
@@ -127,7 +145,7 @@ static void test_dedicated_does_not_block_inline() {
 
 static void test_dedicated_overlap_skip() {
     pc::PeriodicCaller caller;
-    const auto id = caller.add(10ms, [] { std::this_thread::sleep_for(25ms); },
+    const auto id = caller.add(10ms, [] { busy_for(25ms); },
                                {.execution_mode = pc::ExecutionMode::Dedicated});
     std::this_thread::sleep_for(500ms);
     caller.stop();
@@ -140,7 +158,7 @@ static void test_dedicated_overlap_skip() {
 
 static void test_dedicated_coalesce() {
     pc::PeriodicCaller caller;
-    const auto id = caller.add(10ms, [] { std::this_thread::sleep_for(25ms); },
+    const auto id = caller.add(10ms, [] { busy_for(25ms); },
                                {.execution_mode = pc::ExecutionMode::Dedicated,
                                 .overlap_policy = pc::OverlapPolicy::Coalesce});
     std::this_thread::sleep_for(500ms);
