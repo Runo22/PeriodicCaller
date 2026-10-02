@@ -7,6 +7,7 @@
 #include <memory>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 using namespace std::chrono_literals;
 namespace pc = periodic_caller;
@@ -225,6 +226,113 @@ static void test_add_after_stop_throws() {
     CHECK(threw);
 }
 
+// Counts destructions of a lambda capture.
+struct DestroyTracker {
+    std::atomic<int>* destroyed;
+    explicit DestroyTracker(std::atomic<int>* d) : destroyed(d) {}
+    DestroyTracker(DestroyTracker&& other) noexcept : destroyed(std::exchange(other.destroyed, nullptr)) {}
+    DestroyTracker(const DestroyTracker&) = delete;
+    DestroyTracker& operator=(const DestroyTracker&) = delete;
+    DestroyTracker& operator=(DestroyTracker&&) = delete;
+    ~DestroyTracker() {
+        if (destroyed) ++*destroyed;
+    }
+};
+
+static void test_remove_and_wait_waits_for_running_call() {
+    for (const auto mode : {pc::ExecutionMode::Inline, pc::ExecutionMode::Dedicated}) {
+        pc::PeriodicCaller caller;
+        std::atomic<bool> started{false}, finished{false};
+        std::atomic<int> destroyed{0};
+        const auto id = caller.add(1ms, [&, t = DestroyTracker(&destroyed)] {
+            started = true;
+            busy_for(50ms);
+            finished = true;
+        }, {.execution_mode = mode, .run_immediately = true});
+        while (!started) std::this_thread::yield();
+        CHECK(caller.remove_and_wait(id));
+        CHECK(finished);        // Returned only after the running call ended,
+        CHECK(destroyed == 1);  // and after the lambda was destroyed.
+        CHECK(!caller.remove_and_wait(id));
+    }
+}
+
+static void test_remove_destroys_idle_task_immediately() {
+    pc::PeriodicCaller caller;
+    std::atomic<int> destroyed{0};
+    const auto id = caller.add(1h, [t = DestroyTracker(&destroyed)] {},
+                               {.execution_mode = pc::ExecutionMode::Dedicated});
+    CHECK(caller.remove(id));
+    CHECK(destroyed == 1);
+}
+
+static void test_remove_and_wait_on_self() {
+    for (const auto mode : {pc::ExecutionMode::Inline, pc::ExecutionMode::Dedicated}) {
+        pc::PeriodicCaller caller;
+        std::atomic<int> n{0};
+        std::atomic<int> destroyed{0};
+        pc::TaskId id = 0;
+        id = caller.add(2ms, [&, t = DestroyTracker(&destroyed)] {
+            if (++n == 2) caller.remove_and_wait(id);  // Must not deadlock.
+        }, {.execution_mode = mode});
+        std::this_thread::sleep_for(60ms);
+        CHECK(n == 2);
+        CHECK(destroyed == 1);  // Destroyed by the runner right after the call.
+    }
+}
+
+static void test_remove_and_wait_after_remove() {
+    // A task removed with remove() while running is still waited for.
+    pc::PeriodicCaller caller;
+    std::atomic<bool> started{false}, finished{false};
+    const auto id = caller.add(1ms, [&] {
+        started = true;
+        busy_for(40ms);
+        finished = true;
+    }, {.execution_mode = pc::ExecutionMode::Dedicated, .run_immediately = true});
+    while (!started) std::this_thread::yield();
+    CHECK(caller.remove(id));
+    caller.remove_and_wait(id);
+    CHECK(finished);
+}
+
+static void test_task_scope() {
+    pc::PeriodicCaller caller;
+    std::atomic<int> calls{0};
+    std::atomic<int> destroyed{0};
+    {
+        pc::TaskScope scope(caller);
+        scope.add(1ms, [&, t = DestroyTracker(&destroyed)] { ++calls; });
+        const auto b = scope.add(2ms, [&, t = DestroyTracker(&destroyed)] { ++calls; busy_for(1ms); },
+                                 {.execution_mode = pc::ExecutionMode::Dedicated});
+        scope.add(5ms, [&, t = DestroyTracker(&destroyed)] { ++calls; });
+        std::this_thread::sleep_for(30ms);
+        CHECK(scope.remove(b));
+        CHECK(!scope.remove(b));
+        CHECK(destroyed == 1);
+    }  // Destructor clears the rest and waits.
+    CHECK(destroyed == 3);
+    const int at_end = calls;
+    std::this_thread::sleep_for(20ms);
+    CHECK(calls == at_end);
+}
+
+static void test_shared_instance() {
+    auto& a = pc::PeriodicCaller::shared();
+    auto& b = pc::PeriodicCaller::shared();
+    CHECK(&a == &b);
+    std::atomic<int> n{0};
+    {
+        pc::TaskScope scope;  // Defaults to the shared instance.
+        scope.add(1ms, [&] { ++n; });
+        std::this_thread::sleep_for(20ms);
+    }
+    CHECK(n > 0);
+    pc::PeriodicCaller::shutdown_shared();
+    CHECK(pc::PeriodicCaller::shared().add(1h, [] {}) > 0);  // Re-created on demand.
+    pc::PeriodicCaller::shutdown_shared();
+}
+
 int main() {
     test_runs_at_period();
     test_no_drift();
@@ -241,6 +349,12 @@ int main() {
     test_on_error_handler();
     test_destroy_while_dedicated_running();
     test_add_after_stop_throws();
+    test_remove_and_wait_waits_for_running_call();
+    test_remove_destroys_idle_task_immediately();
+    test_remove_and_wait_on_self();
+    test_remove_and_wait_after_remove();
+    test_task_scope();
+    test_shared_instance();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return EXIT_FAILURE;

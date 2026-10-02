@@ -6,14 +6,17 @@ on:
 
 jobs:
   msvc:
+    name: msvc (${{ matrix.config }}, ${{ matrix.shared == 'ON' && 'dll' || 'static' }})
     runs-on: windows-latest
     strategy:
+      fail-fast: false
       matrix:
         config: [Debug, Release]
+        shared: ['OFF', 'ON']
     steps:
       - uses: actions/checkout@v5
       - name: Configure
-        run: cmake --preset msvc-x64-ci
+        run: cmake --preset msvc-x64-ci -DPERIODIC_CALLER_SHARED=${{ matrix.shared }}
       - name: Build
         run: cmake --build build --config ${{ matrix.config }}
       - name: Test

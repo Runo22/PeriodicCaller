@@ -53,11 +53,15 @@ int main() {
 |---|---|
 | `PeriodicCaller(SchedulerOptions = {})` | Scheduler'ı başlatır. `spin_threshold`, `high_priority_thread`, `use_mmcss`, `on_error` |
 | `TaskId add(period, task, TaskOptions = {})` | Görev ekler. `execution_mode`, `overlap_policy`, `missed_tick_policy`, `run_immediately` |
-| `bool remove(TaskId)` | Görevi kaldırır; o an çalışıyorsa o çağrı tamamlanır |
+| `bool remove(TaskId)` | Görevi kaldırır, beklemez; o an çalışıyorsa o çağrı tamamlanır |
+| `bool remove_and_wait(TaskId)` | Kaldırır, çalışan çağrının bitmesini ve lambda'nın yok edilmesini bekler |
 | `bool set_period(TaskId, period)` | Periyodu değiştirir |
 | `std::optional<TaskStats> stats(TaskId)` | Gecikme / sayaç istatistikleri |
 | `void stop()` | Scheduler'ı ve tüm worker'ları durdurur; istatistikler okunabilir kalır (destructor da çağırır) |
 | `bool uses_high_resolution_timer()` | Yüksek çözünürlüklü timer kullanılıyor mu |
+| `static PeriodicCaller& shared(SchedulerOptions = {})` | Süreç genelinde ortak instance (DLL içinde tek) |
+| `static void shutdown_shared()` | Ortak instance'ı durdurur ve yok eder |
+| `TaskScope(PeriodicCaller& = shared())` | Bir grup task'ı (örn. bir plugin'in) sahiplenir; `clear()`/destructor hepsini kaldırıp bekler |
 
 ## Derleme
 
@@ -96,6 +100,44 @@ target_link_libraries(my_app PRIVATE periodic_caller::periodic_caller)
 
 Kural: görev süresi periyodunun küçük bir kısmıysa (`stats().max_duration` ile ölçün) Inline, değilse Dedicated.
 Dedicated görevler farklı bir thread'de çalıştığı için paylaşılan verilere erişimde senkronizasyon gerekir.
+
+## Birden fazla DLL (plugin) ile kullanım
+
+Kod hangi modüle derlenirse scheduler o modülde yaşar. Tüm plugin'lerin **tek bir ortak scheduler** kullanması için:
+
+1. `PeriodicCaller.cpp`'yi **tek bir DLL**'e (örn. util DLL'iniz) derleyin ve o projede `PERIODIC_CALLER_EXPORTS` tanımlayın.
+   Bu DLL'i kullanan tüm modüllerde (exe, plugin'ler) `PERIODIC_CALLER_IMPORTS` tanımlayın.
+   CMake ile: `-DPERIODIC_CALLER_SHARED=ON` bunu otomatik yapar.
+   Kendi export makronuz varsa `PERIODIC_CALLER_API`'yi önceden tanımlayabilirsiniz.
+2. Herkes `PeriodicCaller::shared()` kullanır; bu, süreçte **tek** instance döndürür.
+3. Plugin task'larını bir `TaskScope` ile ekler ve kendi kapanış fonksiyonunda temizler:
+
+```cpp
+// plugin.cpp
+pc::TaskScope* g_scope = nullptr;   // Global nesne DEĞİL, pointer (aşağıya bakın)
+
+extern "C" __declspec(dllexport) void plugin_start() {
+    g_scope = new pc::TaskScope();                 // PeriodicCaller::shared() kullanır
+    g_scope->add(1ms, [] { /* ... */ });
+    g_scope->add(20ms, [] { /* ağır iş */ }, {.execution_mode = pc::ExecutionMode::Dedicated});
+}
+
+extern "C" __declspec(dllexport) void plugin_stop() {
+    delete std::exchange(g_scope, nullptr);        // Task'ları kaldırır, çalışanları BEKLER
+}
+// Host: plugin_stop() -> FreeLibrary(plugin)
+```
+
+Kurallar:
+
+- **Unload'dan önce temizlik şart.** Task'ın kodu plugin DLL'inde; plugin `FreeLibrary` ile kalkarken task kayıtlı veya çalışıyorsa süreç çöker.
+  `TaskScope::clear()` / destructor'ı ve `remove_and_wait()`, çalışan çağrının bitmesini **ve** lambda'nın yok edilmesini bekler; döndükten sonra unload güvenlidir.
+- **DllMain'de / global destructor'da temizlik yapmayın.** `DLL_PROCESS_DETACH` loader lock altında çalışır; orada thread beklemek deadlock'a yol açar.
+  Bu yüzden `TaskScope` global nesne değil, `plugin_stop()` içinde silinen bir pointer olmalı.
+- `shared()` instance'ı bilerek otomatik yok edilmez (aynı loader lock nedeniyle). Süreç kapanırken bir şey yapmanız gerekmez;
+  util DLL'i süreç bitmeden kaldırılacaksa host önce tüm plugin'leri durdurup sonra `PeriodicCaller::shutdown_shared()` çağırmalıdır.
+- Tüm modüller aynı Visual Studio sürümü ve aynı `/MD` ayarıyla derlenmelidir (API'de `std::move_only_function` vb. STL tipleri var).
+- `remove()` beklemez (task içinden veya hızlı kaldırma için); unload öncesi her zaman `remove_and_wait()` / `TaskScope` kullanın.
 
 ## Hassasiyet notları
 

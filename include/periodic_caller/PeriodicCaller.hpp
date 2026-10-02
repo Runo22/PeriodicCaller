@@ -16,17 +16,39 @@
 //
 // Short tasks run inline on the scheduler thread (most precise). Long tasks
 // should use ExecutionMode::Dedicated so they cannot delay the other tasks.
+//
+// Using it from several DLLs (plugins): compile PeriodicCaller.cpp into ONE
+// DLL (e.g. your utility DLL) with PERIODIC_CALLER_EXPORTS defined, and define
+// PERIODIC_CALLER_IMPORTS in every module that uses it. All modules then share
+// PeriodicCaller::shared(). Plugins register their tasks through a TaskScope
+// and clear it in their shutdown function, before FreeLibrary. See README.
 
 #include <chrono>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <utility>
+#include <vector>
 #include <version>
 
 #if !defined(__cpp_lib_move_only_function)
 #error "PeriodicCaller requires C++23 std::move_only_function: VS 2022 17.2+ with /std:c++latest (CMake: cxx_std_23)."
+#endif
+
+// Export macro. Static library (default): empty. DLL: define
+// PERIODIC_CALLER_EXPORTS while building the DLL and PERIODIC_CALLER_IMPORTS in
+// the modules that use it. A project may also predefine PERIODIC_CALLER_API.
+#if !defined(PERIODIC_CALLER_API)
+#if defined(PERIODIC_CALLER_EXPORTS)
+#define PERIODIC_CALLER_API __declspec(dllexport)
+#elif defined(PERIODIC_CALLER_IMPORTS)
+#define PERIODIC_CALLER_API __declspec(dllimport)
+#else
+#define PERIODIC_CALLER_API
+#endif
 #endif
 
 namespace periodic_caller {
@@ -94,7 +116,12 @@ struct TaskStats {
     std::chrono::nanoseconds max_duration{0};
 };
 
-class PeriodicCaller {
+// C4251: the private std::unique_ptr member has no dll-interface. Harmless,
+// since every module is built with the same compiler and /MD runtime.
+#pragma warning(push)
+#pragma warning(disable : 4251)
+
+class PERIODIC_CALLER_API PeriodicCaller {
 public:
     explicit PeriodicCaller(SchedulerOptions options = {});
     // Stops everything and waits for running tasks to finish.
@@ -113,6 +140,13 @@ public:
     // happen. Safe to call from inside a task (including on itself).
     bool remove(TaskId id);
 
+    // Like remove(), but also waits until a running call has finished and
+    // destroys the task object (the lambda and its captures) before returning.
+    // After this returns, no code or data of the task is touched again, so the
+    // module that owns it may be unloaded. When called from inside the task
+    // itself it cannot wait for itself: it behaves like remove().
+    bool remove_and_wait(TaskId id);
+
     // Changes the period of a task; the new grid starts from its last tick.
     bool set_period(TaskId id, std::chrono::nanoseconds period);
 
@@ -125,9 +159,71 @@ public:
     // true if the high-resolution waitable timer is in use.
     bool uses_high_resolution_timer() const noexcept;
 
+    // Process-wide instance, shared by every module when PeriodicCaller lives
+    // in a DLL. Created on first use; `options` only apply to that first call.
+    // It is intentionally NOT destroyed automatically: a destructor running in
+    // DllMain (DLL_PROCESS_DETACH) would join threads under the loader lock and
+    // deadlock. Call shutdown_shared() from the host before unloading the DLL
+    // that contains PeriodicCaller (not needed at process exit).
+    static PeriodicCaller& shared(SchedulerOptions options = {});
+
+    // Stops and destroys the shared instance. Waits for running tasks.
+    // A later shared() call creates a new instance.
+    static void shutdown_shared();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> _impl;
+};
+
+#pragma warning(pop)
+
+// Owns a group of tasks, typically all tasks of one plugin. clear() (or the
+// destructor) removes every task in the group and waits for running calls to
+// finish, so the plugin can be unloaded safely right afterwards.
+//
+// Call clear() from the plugin's own shutdown function, NOT from DllMain or a
+// global destructor that runs during FreeLibrary (loader lock).
+class TaskScope {
+public:
+    explicit TaskScope(PeriodicCaller& caller = PeriodicCaller::shared()) : _caller(&caller) {}
+    ~TaskScope() { clear(); }
+
+    TaskScope(const TaskScope&) = delete;
+    TaskScope& operator=(const TaskScope&) = delete;
+
+    TaskId add(std::chrono::nanoseconds period, Task task, TaskOptions options = {}) {
+        const auto id = _caller->add(period, std::move(task), options);
+        std::scoped_lock lock(_mutex);
+        _ids.push_back(id);
+        return id;
+    }
+
+    // Removes one task of this scope and waits for it (see remove_and_wait).
+    bool remove(TaskId id) {
+        {
+            std::scoped_lock lock(_mutex);
+            if (std::erase(_ids, id) == 0) return false;
+        }
+        return _caller->remove_and_wait(id);
+    }
+
+    // Removes all tasks of this scope and waits for running calls to finish.
+    void clear() {
+        std::vector<TaskId> ids;
+        {
+            std::scoped_lock lock(_mutex);
+            ids.swap(_ids);
+        }
+        for (const auto id : ids) _caller->remove_and_wait(id);
+    }
+
+    PeriodicCaller& caller() const noexcept { return *_caller; }
+
+private:
+    PeriodicCaller* _caller;
+    std::mutex _mutex;
+    std::vector<TaskId> _ids;
 };
 
 }  // namespace periodic_caller

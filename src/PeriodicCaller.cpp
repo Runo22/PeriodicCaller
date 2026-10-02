@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <condition_variable>
 #include <mutex>
 #include <stdexcept>
 #include <stop_token>
@@ -124,6 +125,8 @@ struct PeriodicCaller::Impl {
         TaskStats stats;
         nanoseconds lateness_sum{0};
         bool removed = false;
+        bool running = false;     // A call is in progress (either mode).
+        std::thread::id runner;   // Thread making that call.
 
         // Dedicated mode only.
         bool executing = false;
@@ -143,6 +146,9 @@ struct PeriodicCaller::Impl {
     SchedulerOptions _options;
     mutable std::mutex _mutex;
     std::unordered_map<TaskId, std::shared_ptr<Entry>> _entries;
+    // Removed while running; the runner destroys the task when the call returns.
+    std::unordered_map<TaskId, std::shared_ptr<Entry>> _draining;
+    std::condition_variable _idle;  // Notified whenever a call finishes.
     std::vector<Retired> _retired;
     TaskId _next_id = 1;
     bool _stopped = false;
@@ -223,18 +229,69 @@ struct PeriodicCaller::Impl {
         return id;
     }
 
+    // Unregisters `id` from _entries (or finds it in _draining if a previous
+    // remove is still finishing). If the task is idle its object is moved into
+    // `dead`, to be destroyed by the caller outside the lock; if it is running,
+    // the runner destroys it when the call returns (see finish_run_locked).
+    std::shared_ptr<Entry> unregister_locked(TaskId id, Task& dead) {
+        const auto it = _entries.find(id);
+        if (it == _entries.end()) {
+            const auto d = _draining.find(id);
+            return d == _draining.end() ? nullptr : d->second;
+        }
+        auto e = it->second;
+        _entries.erase(it);
+        e->removed = true;
+        retire_locked(e);
+        if (e->running) {
+            _draining.emplace(id, e);
+        } else {
+            dead = std::move(e->task);
+        }
+        return e;
+    }
+
     bool remove(TaskId id) {
+        Task dead;  // Declared first: destroyed last, outside the lock.
         {
             std::scoped_lock lock(_mutex);
-            const auto it = _entries.find(id);
-            if (it == _entries.end()) return false;
-            it->second->removed = true;
-            retire_locked(it->second);
-            _entries.erase(it);
+            if (!_entries.contains(id)) return false;
+            unregister_locked(id, dead);
         }
         wake();
         reap(false);
         return true;
+    }
+
+    bool remove_and_wait(TaskId id) {
+        Task dead;
+        bool found;
+        {
+            std::unique_lock lock(_mutex);
+            found = _entries.contains(id);
+            const auto e = unregister_locked(id, dead);
+            if (!e) return false;
+            // From inside the task itself we would wait for ourselves forever.
+            if (!(e->running && e->runner == std::this_thread::get_id())) {
+                _idle.wait(lock, [&] { return !e->running; });
+            }
+        }
+        wake();
+        reap(false);
+        return found;
+    }
+
+    // Called by the thread that ran `e` once its call(s) returned, lock held.
+    void finish_run_locked(std::unique_lock<std::mutex>& lock, Entry& e) {
+        if (e.removed) {
+            Task dead = std::move(e.task);
+            lock.unlock();
+            dead = nullptr;  // Destroy the lambda (and captures) outside the lock.
+            lock.lock();
+            _draining.erase(e.id);
+        }
+        e.running = false;
+        _idle.notify_all();
     }
 
     // Asks a dedicated worker to exit; it is joined later by reap().
@@ -374,11 +431,15 @@ struct PeriodicCaller::Impl {
             if (due->options.execution_mode == ExecutionMode::Dedicated) {
                 dispatch_dedicated_locked(*due, tick);
             } else {
+                due->running = true;
+                due->runner = std::this_thread::get_id();
                 lock.unlock();
                 const auto result = invoke(*due);
                 lock.lock();
-                if (due->removed) continue;
-                record_locked(*due, tick, result);
+                const bool removed = due->removed;
+                if (!removed) record_locked(*due, tick, result);
+                finish_run_locked(lock, *due);
+                if (removed) continue;
             }
             skip_missed_locked(*due, Clock::now());
         }
@@ -391,17 +452,25 @@ struct PeriodicCaller::Impl {
                    !st.stop_requested()) {
                 std::unique_lock lock(_mutex);
                 if (!e->executing) continue;
+                if (e->removed) {  // Removed after dispatch, before it started.
+                    e->executing = false;
+                    continue;
+                }
+                e->running = true;
+                e->runner = std::this_thread::get_id();
                 auto tick = e->dispatched_tick;
                 while (true) {
                     lock.unlock();
                     const auto result = invoke(*e);
                     lock.lock();
+                    if (e->removed) break;
                     record_locked(*e, tick, result);
-                    if (!e->pending_tick || e->removed || st.stop_requested()) break;
+                    if (!e->pending_tick || st.stop_requested()) break;
                     tick = *std::exchange(e->pending_tick, std::nullopt);
                 }
                 e->pending_tick.reset();
                 e->executing = false;
+                finish_run_locked(lock, *e);
             }
         }
         e->worker_exited = true;
@@ -422,6 +491,8 @@ TaskId PeriodicCaller::add(std::chrono::nanoseconds period, Task task, TaskOptio
 }
 
 bool PeriodicCaller::remove(TaskId id) { return _impl->remove(id); }
+
+bool PeriodicCaller::remove_and_wait(TaskId id) { return _impl->remove_and_wait(id); }
 
 bool PeriodicCaller::set_period(TaskId id, std::chrono::nanoseconds period) {
     if (period <= std::chrono::nanoseconds::zero()) {
@@ -450,5 +521,27 @@ std::optional<TaskStats> PeriodicCaller::stats(TaskId id) const {
 void PeriodicCaller::stop() { _impl->stop(); }
 
 bool PeriodicCaller::uses_high_resolution_timer() const noexcept { return _impl->_high_resolution; }
+
+namespace {
+// Defined in this translation unit, so there is exactly one per module that
+// contains PeriodicCaller.cpp: one per process when it lives in a DLL.
+std::mutex shared_instance_mutex;
+PeriodicCaller* shared_instance = nullptr;  // Leaked on purpose; see header.
+}  // namespace
+
+PeriodicCaller& PeriodicCaller::shared(SchedulerOptions options) {
+    std::scoped_lock lock(shared_instance_mutex);
+    if (!shared_instance) shared_instance = new PeriodicCaller(std::move(options));
+    return *shared_instance;
+}
+
+void PeriodicCaller::shutdown_shared() {
+    PeriodicCaller* instance;
+    {
+        std::scoped_lock lock(shared_instance_mutex);
+        instance = std::exchange(shared_instance, nullptr);
+    }
+    delete instance;
+}
 
 }  // namespace periodic_caller
