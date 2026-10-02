@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 project(PeriodicCaller VERSION 0.1.0 LANGUAGES CXX)
 
 if(NOT MSVC)
-    message(FATAL_ERROR "PeriodicCaller supports MSVC (Visual Studio 2022 17.2+) only.")
+    message(FATAL_ERROR "PeriodicCaller supports MSVC (Visual Studio 2022 17.2+ / 2026) only.")
 endif()
 
 option(PERIODIC_CALLER_BUILD_EXAMPLES "Build examples" ${PROJECT_IS_TOP_LEVEL})

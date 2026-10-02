@@ -61,7 +61,7 @@ int main() {
 
 ## Derleme
 
-Gereksinimler: Windows 10 1803+ (daha eskisi de çalışır, hassasiyet düşer), **MSVC / Visual Studio 2022 17.2+**, CMake 3.21+.
+Gereksinimler: Windows 10 1803+ (daha eskisi de çalışır, hassasiyet düşer), **MSVC (Visual Studio 2022 17.2+ veya Visual Studio 2026)**, CMake 3.21+.
 Yalnızca MSVC desteklenir.
 
 ```bat

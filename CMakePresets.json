@@ -3,15 +3,14 @@
   "configurePresets": [
     {
       "name": "msvc-x64",
-      "displayName": "Visual Studio 2022 x64",
-      "generator": "Visual Studio 17 2022",
+      "displayName": "Visual Studio x64 (newest installed)",
       "architecture": "x64",
       "binaryDir": "${sourceDir}/build"
     },
     {
       "name": "msvc-x64-ci",
       "inherits": "msvc-x64",
-      "displayName": "Visual Studio 2022 x64 (warnings as errors)",
+      "displayName": "Visual Studio x64 (warnings as errors)",
       "cacheVariables": { "PERIODIC_CALLER_WARNINGS_AS_ERRORS": "ON" }
     }
   ],
