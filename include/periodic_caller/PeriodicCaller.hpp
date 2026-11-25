@@ -88,7 +88,7 @@ public:
 
     // num/den nanoseconds. Throws std::invalid_argument if den <= 0.
     static constexpr Period from_ratio(std::int64_t num_ns, std::int64_t den) {
-        Period p;
+        Period p{std::chrono::nanoseconds(0)};
         if (den <= 0) throw std::invalid_argument("Period: denominator must be positive");
         p._num = num_ns;
         p._den = den;
@@ -117,8 +117,6 @@ public:
     friend constexpr bool operator==(const Period&, const Period&) = default;
 
 private:
-    constexpr Period() = default;
-
     static constexpr std::int64_t checked_mul(std::int64_t a, std::int64_t b) {
         if (a != 0 && (a > std::numeric_limits<std::int64_t>::max() / (b < 0 ? -b : b) ||
                        a < std::numeric_limits<std::int64_t>::min() / (b < 0 ? -b : b))) {
