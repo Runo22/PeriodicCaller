@@ -45,6 +45,25 @@ void busy_for(std::chrono::nanoseconds d) {
     }
 }
 
+// CPU cycles used by the whole process. Far finer than GetProcessTimes, which
+// only advances in ~15.6 ms steps and shows a near-idle process as 0%.
+double process_cycles() {
+    ULONG64 cycles = 0;
+    QueryProcessCycleTime(GetCurrentProcess(), &cycles);
+    return static_cast<double>(cycles);
+}
+
+// Cycle counter rate: spin for 200 ms on this thread and count its cycles.
+double cycles_per_second() {
+    ULONG64 c0 = 0, c1 = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &c0);
+    const auto t0 = pc::Clock::now();
+    while (pc::Clock::now() - t0 < 200ms) {
+    }
+    QueryThreadCycleTime(GetCurrentThread(), &c1);
+    return static_cast<double>(c1 - c0) / std::chrono::duration<double>(pc::Clock::now() - t0).count();
+}
+
 double us(std::chrono::nanoseconds d) { return std::chrono::duration<double, std::micro>(d).count(); }
 
 std::vector<long long> parse_list(const char* s) {
@@ -85,6 +104,7 @@ int main(int argc, char** argv) {
     GetSystemInfo(&si);
     const auto cores = static_cast<double>(si.dwNumberOfProcessors);
     const auto work = std::chrono::microseconds(work_us);
+    const double cycle_rate = cycles_per_second();
 
     for (const auto spin : spins) {
         pc::PeriodicCaller caller({.max_spin = std::chrono::microseconds(spin), .use_mmcss = mmcss});
@@ -101,10 +121,13 @@ int main(int argc, char** argv) {
             {"50Hz", caller.add(pc::hz(50), body, {.phase = 1ms, .name = "bench 50Hz"})},
         };
 
+        std::this_thread::sleep_for(200ms);  // Let the wake-up lead settle.
         const double cpu0 = cpu_seconds();
+        const double cycles0 = process_cycles();
         const auto t0 = pc::Clock::now();
         std::this_thread::sleep_for(std::chrono::seconds(seconds));
-        const double cpu = cpu_seconds() - cpu0;
+        const double coarse_cpu = cpu_seconds() - cpu0;
+        const double cpu = (process_cycles() - cycles0) / cycle_rate;
         const double wall = std::chrono::duration<double>(pc::Clock::now() - t0).count();
         caller.stop();
 
@@ -112,9 +135,10 @@ int main(int argc, char** argv) {
         const double work_cpu = static_cast<double>(work_us) * 1e-6 * (200 + 200 + 60 + 60 + 50) * wall;
         std::printf("\n== max_spin = %lld us, work = %lld us/frame, %s, %.1f s ==\n", spin, work_us,
                     mmcss ? "MMCSS" : "no MMCSS", wall);
-        std::printf("CPU: %.2f%% of one core (%.3f%% of all %d), scheduler overhead ~%.2f%% of one core\n",
+        std::printf("CPU: %.3f%% of one core (%.4f%% of all %d logical CPUs; GetProcessTimes: %.2f%%), "
+                    "scheduler overhead ~%.3f%% of one core\n",
                     100.0 * cpu / wall, 100.0 * cpu / wall / cores, static_cast<int>(cores),
-                    100.0 * (cpu - work_cpu) / wall);
+                    100.0 * coarse_cpu / wall, 100.0 * (cpu - work_cpu) / wall);
         std::printf("%-8s %8s %6s %6s | %8s %7s %7s %8s %9s | %8s %9s | %7s\n", "task", "runs", "miss",
                     "skip", "lat avg", "p50<=", "p99<=", "p99.9<=", "lat max", "tmr avg", "tmr max", "lead");
         for (const auto& r : rows) {

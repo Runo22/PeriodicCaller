@@ -187,8 +187,9 @@ static void test_tasks_do_not_delay_each_other() {
     const auto fast_id = caller.add(2ms, [&] { ++fast; });
     const auto slow_id = caller.add(10ms, [] { busy_for(30ms); });  // Always late.
     std::this_thread::sleep_for(500ms);
-    caller.stop();
+    // Before stop(): it waits up to 30 ms for the slow task's current run.
     const auto expected = ticks_since(start, 2ms);
+    caller.stop();
     CHECK(fast >= expected - 3);  // CatchUp, own thread: nothing lost.
     const auto fs = caller.stats(fast_id);
     CHECK(fs->avg_lateness < 1ms);
@@ -595,7 +596,8 @@ static void test_cpu_usage_is_low() {
         const double percent_of_one_core = 100.0 * cpu / wall;
         std::printf("  cpu (max_spin=%lld us): %.2f%% of one core, %d runs\n",
                     static_cast<long long>(max_spin.count()), percent_of_one_core, n.load());
-        // ~540 wake-ups/s; a spinning scheduler would use 100%.
+        // ~540 wake-ups/s; a spinning scheduler would use 100%. (GetProcessTimes
+        // has a ~15.6 ms granularity: 0.00% means below ~0.8%; see the bench.)
         CHECK(percent_of_one_core < (max_spin == 0us ? 5.0 : 10.0));
     }
 }
