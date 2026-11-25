@@ -43,7 +43,7 @@ extern "C" __declspec(dllexport) void plugin_start(std::atomic<int>* calls, std:
                    }
                    ++*calls;
                },
-               {.execution_mode = pc::ExecutionMode::Dedicated});
+               {.name = "plugin 5 ms"});
 }
 
 extern "C" __declspec(dllexport) void plugin_stop() {

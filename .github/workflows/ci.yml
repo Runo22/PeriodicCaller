@@ -23,3 +23,5 @@ jobs:
         run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
       - name: Run example (precision report)
         run: build/${{ matrix.config }}/periodic_caller_example.exe
+      - name: Run benchmark (short; VM numbers are only indicative)
+        run: build/${{ matrix.config }}/periodic_caller_bench.exe --seconds 3 --spin 0,50

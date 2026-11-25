@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(PeriodicCaller VERSION 0.1.0 LANGUAGES CXX)
+project(PeriodicCaller VERSION 0.2.0 LANGUAGES CXX)
 
 if(NOT MSVC)
     message(FATAL_ERROR "PeriodicCaller supports MSVC (Visual Studio 2022 17.2+ / 2026) only.")
@@ -7,6 +7,7 @@ endif()
 
 option(PERIODIC_CALLER_BUILD_EXAMPLES "Build examples" ${PROJECT_IS_TOP_LEVEL})
 option(PERIODIC_CALLER_BUILD_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
+option(PERIODIC_CALLER_BUILD_BENCH "Build the precision/CPU benchmark" ${PROJECT_IS_TOP_LEVEL})
 option(PERIODIC_CALLER_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(PERIODIC_CALLER_SHARED "Build periodic_caller as a DLL (one shared scheduler per process)" OFF)
 
@@ -40,6 +41,12 @@ if(PERIODIC_CALLER_BUILD_EXAMPLES)
     add_executable(periodic_caller_example examples/basic.cpp)
     target_link_libraries(periodic_caller_example PRIVATE periodic_caller)
     periodic_caller_configure(periodic_caller_example)
+endif()
+
+if(PERIODIC_CALLER_BUILD_BENCH)
+    add_executable(periodic_caller_bench bench/bench.cpp)
+    target_link_libraries(periodic_caller_bench PRIVATE periodic_caller)
+    periodic_caller_configure(periodic_caller_bench)
 endif()
 
 if(PERIODIC_CALLER_BUILD_TESTS)
