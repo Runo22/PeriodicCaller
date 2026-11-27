@@ -33,7 +33,6 @@ target_include_directories(periodic_caller PUBLIC
     $<INSTALL_INTERFACE:include>)
 # std::move_only_function in the public header needs C++23 for consumers too.
 target_compile_features(periodic_caller PUBLIC cxx_std_23)
-target_link_libraries(periodic_caller PRIVATE winmm)
 periodic_caller_configure(periodic_caller)
 
 if(PERIODIC_CALLER_BUILD_EXAMPLES)

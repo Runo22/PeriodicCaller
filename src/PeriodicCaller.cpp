@@ -7,10 +7,6 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#include <timeapi.h>
-
-// Lets the .cpp be dropped into a plain Visual Studio project without extra linker setup.
-#pragma comment(lib, "winmm.lib")
 
 #include <algorithm>
 #include <atomic>
@@ -105,6 +101,23 @@ private:
     HANDLE _mmcss = nullptr;
 };
 
+// timeBeginPeriod/timeEndPeriod are only needed for the pre-1803 fallback.
+// Loaded from winmm.dll at runtime instead of including <timeapi.h>: that pulls
+// in <mmsyscom.h>, which fails to compile in some host projects, and it would
+// also require linking winmm.lib.
+using TimePeriodFn = UINT(WINAPI*)(UINT);
+constexpr UINT timerr_noerror = 0;
+
+bool begin_time_period() {
+    static const auto fn = load_function<TimePeriodFn>(L"winmm.dll", "timeBeginPeriod");
+    return fn && fn(1) == timerr_noerror;
+}
+
+void end_time_period() {
+    static const auto fn = load_function<TimePeriodFn>(L"winmm.dll", "timeEndPeriod");
+    if (fn) fn(1);
+}
+
 struct RunResult {
     Clock::time_point start;
     Clock::time_point end;
@@ -167,11 +180,11 @@ struct PeriodicCaller::Impl {
         if (!_high_resolution) {
             // Pre-1803 Windows: classic timer, made precise via a 1 ms system tick.
             _timer.h = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
-            _time_period_raised = timeBeginPeriod(1) == TIMERR_NOERROR;
+            _time_period_raised = begin_time_period();
         }
         _wake_event.h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!_timer.h || !_wake_event.h) {
-            if (_time_period_raised) timeEndPeriod(1);
+            if (_time_period_raised) end_time_period();
             throw std::runtime_error("PeriodicCaller: failed to create timer/event handles");
         }
 
@@ -180,7 +193,7 @@ struct PeriodicCaller::Impl {
 
     ~Impl() {
         stop();
-        if (_time_period_raised) timeEndPeriod(1);
+        if (_time_period_raised) end_time_period();
     }
 
     void wake() { SetEvent(_wake_event.h); }

@@ -3,7 +3,7 @@
 C++23 ile yazılmış, Windows için **yüksek hassasiyetli periyodik görev zamanlayıcı**.
 Verilen bir lambda veya fonksiyonu belirtilen periyotla, çağıran thread'i bloklamadan
 ve süreyi olabildiğince yakın tutturarak çalıştırır. Harici bağımlılık yoktur
-(yalnızca Win32 + `winmm`).
+(yalnızca Win32 API).
 
 ## Özellikler
 
@@ -80,7 +80,7 @@ Visual Studio'da: **File → Open → Folder** ile klasörü açın; `CMakePrese
 CMake kullanmadan mevcut bir `.vcxproj`'a eklemek için:
 1. `src/PeriodicCaller.cpp` dosyasını projeye ekleyin, `include/` klasörünü *Additional Include Directories*'e ekleyin.
 2. *C++ Language Standard* = **Preview - Features from the Latest C++ Working Draft (`/std:c++latest`)**.
-3. `winmm.lib` kod içinden (`#pragma comment`) otomatik linklenir.
+3. Ek bir `.lib` linklemeye gerek yoktur (`winmm.dll` gerekirse çalışma anında yüklenir).
 
 Başka bir CMake projesinde:
 
